@@ -9,13 +9,22 @@ import {
   getKaizenThreshold,
   getWeekNumber,
 } from '@/lib/utils'
-import type { QuestCompletionResult } from '@/lib/types'
+import { sendPushNotification } from '@/app/actions/notifications'
+import type { QuestCompletionResult, Quest, QuestPool } from '@/lib/types'
 
 // ── Daily quest generation ────────────────────────────────────
 
 export async function generateDailyQuests(userId: string) {
   const supabase = await createClient()
   const today = formatTodayDate()
+
+  // Clean up stale incomplete quests from previous days
+  await supabase
+    .from('quests')
+    .delete()
+    .eq('user_id', userId)
+    .neq('date_assigned', today)
+    .eq('is_completed', false)
 
   const { data: activeSelections } = await supabase
     .from('quest_selections')
@@ -25,6 +34,15 @@ export async function generateDailyQuests(userId: string) {
     .gte('expires_date', today)
 
   if (!activeSelections || activeSelections.length === 0) return
+
+  // Quick check: if all expected quests already exist, skip generation
+  const { count: todayCount } = await supabase
+    .from('quests')
+    .select('*', { count: 'exact', head: true })
+    .eq('user_id', userId)
+    .eq('date_assigned', today)
+
+  if (todayCount !== null && todayCount >= activeSelections.length) return
 
   for (const sel of activeSelections) {
     const pool = sel.quest_pools
@@ -108,6 +126,134 @@ export async function generateDailyQuests(userId: string) {
       }
     }
   }
+}
+
+// ── Ensure today's quests exist, generating if needed ────────
+// Safe to call from both server components and client (via server action).
+// Returns the quest list for today, generating from active selections if missing.
+
+export async function ensureTodayQuests(userId: string): Promise<{ needsSelection: boolean; quests: Quest[] }> {
+  const supabase = await createClient()
+  const now = new Date()
+  const today = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`
+
+  // If today's quests already exist, return them immediately
+  const { count } = await supabase
+    .from('quests')
+    .select('*', { count: 'exact', head: true })
+    .eq('user_id', userId)
+    .eq('date_assigned', today)
+
+  if (count && count > 0) {
+    const { data: quests } = await supabase
+      .from('quests')
+      .select('*')
+      .eq('user_id', userId)
+      .eq('date_assigned', today)
+      .order('is_completed', { ascending: true })
+      .order('created_at', { ascending: true })
+    return { needsSelection: false, quests: (quests ?? []) as Quest[] }
+  }
+
+  // No quests for today — check for active selections (any, not filtered by expiry)
+  const { data: selections } = await supabase
+    .from('quest_selections')
+    .select('*, quest_pools(*)')
+    .eq('user_id', userId)
+    .eq('is_active', true)
+
+  if (!selections || selections.length === 0) {
+    return { needsSelection: true, quests: [] }
+  }
+
+  // Clean up stale incomplete quests from prior days
+  await supabase
+    .from('quests')
+    .delete()
+    .eq('user_id', userId)
+    .neq('date_assigned', today)
+    .eq('is_completed', false)
+
+  // Build insert rows for each non-elite selection
+  const questsToInsert = selections.flatMap((sel) => {
+    const pool = sel.quest_pools as QuestPool | null
+    if (!pool || pool.category === 'elite') return []
+    return [{
+      user_id: userId,
+      quest_pool_id: sel.quest_pool_id,
+      title: pool.title,
+      description: pool.description,
+      category: pool.category,
+      quest_type: 'side' as const,
+      xp_reward: pool.xp_reward,
+      stat_target: pool.stat_target,
+      stat_reward: pool.stat_reward ?? 1,
+      is_completed: false,
+      date_assigned: today,
+      date_completed: null,
+    }]
+  })
+
+  const insertedQuests: Quest[] = []
+
+  if (questsToInsert.length > 0) {
+    const { data: inserted, error } = await supabase
+      .from('quests')
+      .insert(questsToInsert)
+      .select()
+
+    if (error) {
+      console.error('Quest generation error:', error)
+      return { needsSelection: false, quests: [] }
+    }
+
+    if (inserted) insertedQuests.push(...(inserted as Quest[]))
+  }
+
+  // Elite quest: unlock at level 6+ (E-rank), weekly rotation keyed to account age
+  const { data: userProfile } = await supabase
+    .from('users')
+    .select('level, created_at')
+    .eq('id', userId)
+    .single()
+
+  if (userProfile && userProfile.level >= 6) {
+    const { data: elitePools } = await supabase
+      .from('quest_pools')
+      .select('*')
+      .eq('category', 'elite')
+      .order('title')
+
+    if (elitePools && elitePools.length > 0) {
+      const weekNumber = Math.floor(
+        (Date.now() - new Date(userProfile.created_at).getTime()) / (7 * 24 * 60 * 60 * 1000)
+      )
+      const elitePool = elitePools[weekNumber % elitePools.length] as QuestPool
+
+      const { data: eliteInserted } = await supabase
+        .from('quests')
+        .insert({
+          user_id: userId,
+          quest_pool_id: elitePool.id,
+          title: elitePool.title,
+          description: elitePool.description,
+          category: elitePool.category,
+          quest_type: 'elite',
+          xp_reward: elitePool.xp_reward,
+          stat_target: elitePool.stat_target,
+          stat_reward: elitePool.stat_reward ?? 2,
+          is_completed: false,
+          date_assigned: today,
+          date_completed: null,
+        })
+        .select()
+        .single()
+
+      if (eliteInserted) insertedQuests.push(eliteInserted as Quest)
+    }
+  }
+
+  return { needsSelection: false, quests: insertedQuests }
 }
 
 // ── Expire stale cycles on dashboard load ────────────────────
@@ -375,6 +521,16 @@ export async function completeQuest(questId: string): Promise<QuestCompletionRes
     },
     { onConflict: 'user_id,date' },
   )
+
+  // Push notifications — fire and forget, don't block response
+  if (leveledUp && newRank) {
+    sendPushNotification({
+      user_id: user.id,
+      title: 'LEVEL UP',
+      body: `You are now Level ${newLevel}. ${newRank} Hunter. The system acknowledges your growth.`,
+      tag: 'level-up',
+    }).catch(() => {})
+  }
 
   revalidatePath('/dashboard')
 

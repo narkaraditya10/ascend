@@ -176,6 +176,23 @@ body {
   animation: slideUp 0.25s ease-out forwards;
 }
 
+/* Per-quest XP float on completion */
+@keyframes xpFloat {
+  0%   { opacity: 1; transform: translateY(0); }
+  100% { opacity: 0; transform: translateY(-30px); }
+}
+.xp-float {
+  position: absolute;
+  right: 12px;
+  top: 0;
+  color: #6CCBFF;
+  font-family: 'Share Tech Mono', monospace;
+  font-size: 12px;
+  font-weight: 700;
+  animation: xpFloat 0.8s ease-out forwards;
+  pointer-events: none;
+}
+
 /* Elite unlock banner */
 @keyframes elitePulse {
   0%, 100% { box-shadow: 0 0 8px rgba(245,158,11,0.3); }

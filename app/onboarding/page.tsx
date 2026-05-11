@@ -2,6 +2,8 @@
 
 import { useState, useEffect } from 'react'
 import { completeOnboarding } from '@/app/actions/onboarding'
+import { saveNotificationSubscription } from '@/app/actions/notifications'
+import { requestNotificationPermission, registerServiceWorker, subscribeUserToPush } from '@/lib/notifications'
 import { assignArchetype, getBaselineStats, getArchetypeDescription } from '@/lib/utils'
 import type { Archetype } from '@/lib/types'
 
@@ -131,7 +133,10 @@ export default function OnboardingPage() {
           error={error}
         />
       )}
-      {step === 8 && archetype && (
+      {step === 8 && (
+        <NotificationStep onContinue={() => setStep(9)} />
+      )}
+      {step === 9 && archetype && (
         <StatsReveal
           archetype={archetype}
           onBegin={handleFinish}
@@ -460,6 +465,87 @@ function StatsReveal({
       >
         {loading ? 'INITIALIZING SYSTEM...' : 'BEGIN ASCENSION'}
       </button>
+    </div>
+  )
+}
+
+function NotificationStep({ onContinue }: { onContinue: () => void }) {
+  const [status, setStatus] = useState<'idle' | 'requesting' | 'granted' | 'denied'>('idle')
+
+  async function handleAllow() {
+    setStatus('requesting')
+    try {
+      const granted = await requestNotificationPermission()
+      if (granted) {
+        await registerServiceWorker()
+        try {
+          const sub = await subscribeUserToPush()
+          if (sub) await saveNotificationSubscription(sub.toJSON() as Record<string, unknown>)
+        } catch {}
+        setStatus('granted')
+        setTimeout(onContinue, 1500)
+      } else {
+        setStatus('denied')
+      }
+    } catch {
+      setStatus('denied')
+    }
+  }
+
+  return (
+    <div className="w-full max-w-md fade-in-up text-center">
+      <p className="text-xs tracking-[0.4em] text-text-secondary mb-2">SYSTEM_NOTIFICATIONS</p>
+      <h2
+        className="text-2xl font-semibold text-text-primary mb-6"
+        style={{ fontFamily: 'var(--font-rajdhani)' }}
+      >
+        The system requires access.
+      </h2>
+      <div className="bg-card border border-border rounded-sm p-6 mb-6 text-left">
+        <p className="text-text-secondary text-sm leading-relaxed mb-4">
+          The system requires permission to send you reminders and alerts. This is how it holds you accountable.
+        </p>
+        <div className="space-y-2 text-xs text-text-secondary/60">
+          <p>· Daily hunt reminders at 9am, 2pm, 8pm</p>
+          <p>· Streak at risk alerts</p>
+          <p>· Penalty zone warnings and level-up notifications</p>
+        </div>
+      </div>
+
+      {status === 'idle' && (
+        <button
+          onClick={handleAllow}
+          className="w-full bg-aura-primary hover:bg-aura-primary/80 text-text-primary font-bold tracking-widest py-3 rounded-sm transition-all mb-3"
+          style={{ fontFamily: 'var(--font-rajdhani)' }}
+        >
+          ALLOW NOTIFICATIONS
+        </button>
+      )}
+      {status === 'requesting' && (
+        <p className="text-text-secondary text-sm tracking-widest mb-3">REQUESTING PERMISSION...</p>
+      )}
+      {status === 'granted' && (
+        <p style={{ color: '#34d399' }} className="text-sm tracking-widest mb-3">
+          NOTIFICATIONS ENABLED. PROCEEDING...
+        </p>
+      )}
+      {status === 'denied' && (
+        <div className="mb-3">
+          <p className="text-text-secondary/50 text-xs mb-4 leading-relaxed">
+            Notifications disabled. You will receive no reminders.<br />
+            The system will still record your failures.
+          </p>
+        </div>
+      )}
+
+      {(status === 'denied' || status === 'idle') && (
+        <button
+          onClick={onContinue}
+          className="text-xs text-text-secondary/40 tracking-widest hover:text-text-secondary transition-colors"
+        >
+          {status === 'denied' ? 'CONTINUE →' : 'SKIP'}
+        </button>
+      )}
     </div>
   )
 }

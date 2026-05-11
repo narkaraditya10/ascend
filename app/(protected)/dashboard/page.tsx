@@ -1,9 +1,9 @@
 import { createClient } from '@/lib/supabase/server'
 import { redirect } from 'next/navigation'
-import { generateDailyQuests, checkDailyStreak, checkAndExpireCycles } from '@/app/actions/quests'
+import { ensureTodayQuests, checkDailyStreak, checkAndExpireCycles } from '@/app/actions/quests'
 import { getMonarchProgress, getRankColor, formatTodayDate, getKaizenThreshold } from '@/lib/utils'
 import DashboardClient from '@/app/components/DashboardClient'
-import type { UserProfile, Stats, Quest, QuestPool, QuestSelection, CycleReportData, PoolCategory } from '@/lib/types'
+import type { UserProfile, Stats, Quest, QuestPool, QuestSelection, CycleReportData, PoolCategory, PenaltyQuest } from '@/lib/types'
 
 export default async function DashboardPage() {
   const supabase = await createClient()
@@ -95,18 +95,22 @@ export default async function DashboardPage() {
 
   // ── Cycle expiry + streak check + quest generation ───────────
   await checkAndExpireCycles(user.id)
-  if (!needsSelectionPhase) {
-    await checkDailyStreak(user.id)
-    await generateDailyQuests(user.id)
-  }
+  if (!needsSelectionPhase) await checkDailyStreak(user.id)
 
-  const { data: quests } = await supabase
-    .from('quests')
-    .select('*')
-    .eq('user_id', user.id)
-    .eq('date_assigned', today)
-    .order('quest_type', { ascending: true })
-    .order('is_completed', { ascending: true })
+  // ensureTodayQuests generates quests if missing and returns today's list
+  const [ensureResult, penaltyQuestsRes] = await Promise.all([
+    needsSelectionPhase
+      ? Promise.resolve({ needsSelection: true, quests: [] as Quest[] })
+      : ensureTodayQuests(user.id),
+    supabase
+      .from('penalty_quests')
+      .select('*')
+      .eq('user_id', user.id)
+      .eq('date_assigned', today),
+  ])
+
+  const quests = ensureResult.quests
+  const penaltyQuests = (penaltyQuestsRes.data ?? []) as PenaltyQuest[]
 
   // ── Cycle metadata for dashboard ─────────────────────────────
   const currentCycleNumber = needsSelectionPhase
@@ -128,6 +132,7 @@ export default async function DashboardPage() {
       profile={profile}
       stats={stats}
       quests={(quests ?? []) as Quest[]}
+      penaltyQuests={penaltyQuests}
       dayCount={daysSinceJoin}
       monarchProgress={getMonarchProgress(profile.level)}
       rankColor={getRankColor(profile.rank)}

@@ -1,14 +1,19 @@
 'use client'
 
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect, useRef, useCallback } from 'react'
 import { useRouter } from 'next/navigation'
-import { completeQuest, uncompleteQuest } from '@/app/actions/quests'
+import { completeQuest, uncompleteQuest, ensureTodayQuests } from '@/app/actions/quests'
 import { logout } from '@/app/actions/auth'
+import { completePenaltyQuest } from '@/app/actions/penalty'
+import { saveNotificationSubscription } from '@/app/actions/notifications'
+import { registerServiceWorker, subscribeUserToPush } from '@/lib/notifications'
+import { createClient as createBrowserClient } from '@/lib/supabase/client'
 import CycleReport from './CycleReport'
 import SelectionPhase from './SelectionPhase'
 import LevelUpModal from './LevelUpModal'
 import DailyCompletionSummary from './DailyCompletionSummary'
-import type { UserProfile, Stats, Quest, QuestPool, CycleReportData, PoolCategory } from '@/lib/types'
+import PenaltyZone from './PenaltyZone'
+import type { UserProfile, Stats, Quest, QuestPool, CycleReportData, PoolCategory, PenaltyQuest } from '@/lib/types'
 
 const STAT_LABELS: Record<string, string> = {
   strength: 'STR', focus: 'FOC', discipline: 'DIS', confidence: 'CON',
@@ -25,6 +30,7 @@ interface Props {
   profile: UserProfile
   stats: Stats | null
   quests: Quest[]
+  penaltyQuests: PenaltyQuest[]
   dayCount: number
   monarchProgress: number
   rankColor: string
@@ -39,7 +45,7 @@ interface Props {
 }
 
 export default function DashboardClient({
-  profile, stats, quests, dayCount, monarchProgress, rankColor,
+  profile, stats, quests, penaltyQuests, dayCount, monarchProgress, rankColor,
   needsSelectionPhase, isFirstCycle, cycleReport, questPoolsByCategory,
   previousSelectionIds, currentCycleNumber, kaizenThreshold, cycleExpiresDate,
 }: Props) {
@@ -53,10 +59,56 @@ export default function DashboardClient({
     statsGained: { stat: string; value: number }[]
   } | null>(null)
   const [timeUntilReset, setTimeUntilReset] = useState('')
-  const [processingId, setProcessingId] = useState<string | null>(null)
+  const [processingIds, setProcessingIds] = useState<Set<string>>(new Set())
   const [reportDismissed, setReportDismissed] = useState(false)
   const [showSummary, setShowSummary] = useState(false)
   const summaryTriggeredRef = useRef(false)
+  const [penaltyQuestList, setPenaltyQuestList] = useState<PenaltyQuest[]>(penaltyQuests)
+  const [penaltyProcessingId, setPenaltyProcessingId] = useState<string | null>(null)
+  const [isRefreshing, setIsRefreshing] = useState(false)
+
+  // ── Per-quest processing lock helpers ───────────────────────
+  const addProcessing = useCallback((id: string) => {
+    setProcessingIds((prev) => new Set([...prev, id]))
+  }, [])
+  const removeProcessing = useCallback((id: string) => {
+    setProcessingIds((prev) => { const n = new Set(prev); n.delete(id); return n })
+  }, [])
+
+  // ── Realtime subscription for multi-device sync ──────────────
+  useEffect(() => {
+    const supabase = createBrowserClient()
+    const channel = supabase
+      .channel(`quests-sync-${profile.id}`)
+      .on(
+        'postgres_changes',
+        { event: 'UPDATE', schema: 'public', table: 'quests', filter: `user_id=eq.${profile.id}` },
+        (payload) => {
+          const updated = payload.new as unknown as Quest
+          setQuestList((prev) =>
+            prev.map((q) => (q.id === updated.id ? { ...q, ...updated } : q)),
+          )
+        },
+      )
+      .subscribe()
+    return () => { supabase.removeChannel(channel) }
+  }, [profile.id])
+
+  // Setup push notifications silently after login
+  useEffect(() => {
+    async function setup() {
+      if (typeof window === 'undefined') return
+      if (!('Notification' in window)) return
+      if (Notification.permission !== 'granted') return
+      try {
+        await registerServiceWorker()
+        const sub = await subscribeUserToPush()
+        if (sub) await saveNotificationSubscription(sub.toJSON() as Record<string, unknown>)
+      } catch {}
+    }
+    setup()
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
 
   // Completion animation state
   const [flashQuestId, setFlashQuestId] = useState<string | null>(null)
@@ -88,83 +140,114 @@ export default function DashboardClient({
     return () => clearInterval(id)
   }, [])
 
-  async function handleToggleQuest(quest: Quest) {
-    if (processingId) return
-    setProcessingId(quest.id)
-    const capturedOldLevel = profile.level
+  const handleToggleQuest = useCallback((quest: Quest) => {
+    if (processingIds.has(quest.id)) return
+    addProcessing(quest.id)
 
     if (!quest.is_completed) {
-      // Optimistic complete + flash
+      const capturedOldLevel = profile.level
+
+      // ── 1. Instant UI updates — no awaiting, no blocking ──
       setQuestList((prev) => prev.map((q) => q.id === quest.id ? { ...q, is_completed: true } : q))
       setFlashQuestId(quest.id)
       setLocalTotalXP((prev) => prev + quest.xp_reward)
+      setTimeout(() => setFlashQuestId(null), 900)
 
-      const result = await completeQuest(quest.id)
+      // XP delta animation on identity card
+      xpAnimKey.current += 1
+      setXpDelta({ amount: quest.xp_reward, key: xpAnimKey.current })
 
-      if (result.success) {
-        // Clear flash after animation
-        setTimeout(() => setFlashQuestId(null), 900)
-
-        // XP floating delta
-        xpAnimKey.current += 1
-        setXpDelta({ amount: result.xpEarned!, key: xpAnimKey.current })
-
-        // Stat floating delta
-        if (result.statTarget && result.statReward) {
-          statAnimKey.current += 1
-          setStatDelta({ stat: result.statTarget, amount: result.statReward, key: statAnimKey.current })
-        }
-
-        // System message
-        if (msgTimer.current) clearTimeout(msgTimer.current)
-        const statPart = result.statTarget && result.statReward
-          ? `${result.statTarget} +${result.statReward}. `
-          : ''
-        setSystemMessage(`Quest complete. ${statPart}System has recorded your progress.`)
-        msgTimer.current = setTimeout(() => {
-          setSystemMessage(null)
-          setXpDelta(null)
-          setStatDelta(null)
-        }, 3200)
-
-        // Auto-show daily summary when threshold first hit
-        const newCompleted = questList.filter(q => q.id === quest.id ? true : q.is_completed).length
-        if (newCompleted >= kaizenThreshold && !summaryTriggeredRef.current) {
-          summaryTriggeredRef.current = true
-          setTimeout(() => setShowSummary(true), 1400)
-        }
-
-        // Level-up modal (slight delay so flash finishes)
-        if (result.leveledUp && result.newLevel && result.newRank) {
-          setTimeout(() => {
-            setLevelUpData({
-              oldLevel: capturedOldLevel,
-              newLevel: result.newLevel!,
-              oldRank: result.previousRank ?? 'F',
-              newRank: result.newRank!,
-              rankChanged: result.rankChanged ?? false,
-              eliteUnlocked: result.eliteUnlocked ?? false,
-              statsGained: result.statTarget && result.statReward != null
-                ? [{ stat: result.statTarget, value: result.statReward + 2 }]
-                : [],
-            })
-            setShowLevelUpModal(true)
-          }, 600)
-        }
-      } else {
-        // Revert optimistic update
-        setQuestList((prev) => prev.map((q) => q.id === quest.id ? { ...q, is_completed: false } : q))
-        setLocalTotalXP((prev) => prev - quest.xp_reward)
-        setFlashQuestId(null)
+      // Stat delta animation
+      if (quest.stat_target && quest.stat_reward) {
+        statAnimKey.current += 1
+        setStatDelta({ stat: quest.stat_target, amount: quest.stat_reward, key: statAnimKey.current })
       }
+
+      // System message
+      if (msgTimer.current) clearTimeout(msgTimer.current)
+      const statPart = quest.stat_target && quest.stat_reward
+        ? `${quest.stat_target} +${quest.stat_reward}. `
+        : ''
+      setSystemMessage(`Quest complete. ${statPart}System has recorded your progress.`)
+      msgTimer.current = setTimeout(() => {
+        setSystemMessage(null)
+        setXpDelta(null)
+        setStatDelta(null)
+      }, 3200)
+
+      // Daily summary auto-show when threshold first hit
+      const newCompleted = questList.filter((q) => q.id === quest.id ? true : q.is_completed).length
+      if (newCompleted >= kaizenThreshold && !summaryTriggeredRef.current) {
+        summaryTriggeredRef.current = true
+        setTimeout(() => setShowSummary(true), 1400)
+      }
+
+      // ── 2. Background server sync — user is never blocked by this ──
+      completeQuest(quest.id)
+        .then((result) => {
+          removeProcessing(quest.id)
+          if (!result.success) {
+            setQuestList((prev) => prev.map((q) => q.id === quest.id ? { ...q, is_completed: false } : q))
+            setLocalTotalXP((prev) => Math.max(0, prev - quest.xp_reward))
+          } else {
+            if (result.leveledUp && result.newLevel && result.newRank) {
+              setTimeout(() => {
+                setLevelUpData({
+                  oldLevel: capturedOldLevel,
+                  newLevel: result.newLevel!,
+                  oldRank: result.previousRank ?? 'F',
+                  newRank: result.newRank!,
+                  rankChanged: result.rankChanged ?? false,
+                  eliteUnlocked: result.eliteUnlocked ?? false,
+                  statsGained: result.statTarget && result.statReward != null
+                    ? [{ stat: result.statTarget, value: result.statReward + 2 }]
+                    : [],
+                })
+                setShowLevelUpModal(true)
+              }, 600)
+            }
+            router.refresh()
+          }
+        })
+        .catch(() => {
+          removeProcessing(quest.id)
+          setQuestList((prev) => prev.map((q) => q.id === quest.id ? { ...q, is_completed: false } : q))
+          setLocalTotalXP((prev) => Math.max(0, prev - quest.xp_reward))
+        })
     } else {
+      // Uncomplete: instant rollback, background sync
       setQuestList((prev) => prev.map((q) => q.id === quest.id ? { ...q, is_completed: false } : q))
       setLocalTotalXP((prev) => Math.max(0, prev - quest.xp_reward))
-      await uncompleteQuest(quest.id)
-    }
 
-    setProcessingId(null)
+      uncompleteQuest(quest.id)
+        .then(() => { removeProcessing(quest.id); router.refresh() })
+        .catch(() => {
+          removeProcessing(quest.id)
+          setQuestList((prev) => prev.map((q) => q.id === quest.id ? { ...q, is_completed: true } : q))
+          setLocalTotalXP((prev) => prev + quest.xp_reward)
+        })
+    }
+  }, [processingIds, questList, kaizenThreshold, addProcessing, removeProcessing, profile])
+
+  async function handleCompletePenaltyQuest(pq: PenaltyQuest) {
+    if (penaltyProcessingId) return
+    setPenaltyProcessingId(pq.id)
+    setPenaltyQuestList((prev) => prev.map((q) => q.id === pq.id ? { ...q, is_completed: true } : q))
+    await completePenaltyQuest(pq.id)
+    setPenaltyProcessingId(null)
     router.refresh()
+  }
+
+  async function handleRefresh() {
+    if (isRefreshing) return
+    setIsRefreshing(true)
+    try {
+      const result = await ensureTodayQuests(profile.id)
+      if (result.quests.length > 0) setQuestList(result.quests)
+      router.refresh()
+    } finally {
+      setIsRefreshing(false)
+    }
   }
 
   // ── Selection phase overlay ──────────────────────────────────
@@ -208,8 +291,45 @@ export default function DashboardClient({
   const eliteQuest = questList.find((q) => q.quest_type === 'elite')
   const isEliteLocked = profile.level < 6
 
+  const pendingPenaltyQuest = penaltyQuestList.find((pq) => !pq.is_completed)
+  const questsLocked = profile.penalty_tier === 2 && !!pendingPenaltyQuest
+
+  // Penalty zone full-screen overlay (cannot dismiss)
+  if (profile.penalty_zone_active && profile.penalty_zone_started_at) {
+    return (
+      <PenaltyZone
+        startedAt={profile.penalty_zone_started_at}
+        initialActiveTime={profile.penalty_zone_active_time ?? 0}
+      />
+    )
+  }
+
   return (
     <div className="max-w-lg mx-auto">
+      {/* Tier 1 penalty banner */}
+      {profile.penalty_tier === 1 && (
+        <div
+          className="px-4 py-2 text-center"
+          style={{ background: 'rgba(255,107,107,0.06)', borderBottom: '1px solid rgba(255,107,107,0.3)' }}
+        >
+          <p style={{ fontFamily: 'var(--font-share-tech-mono)', fontSize: '10px', color: '#ff6b6b' }}>
+            STAT PENALTY ACTIVE — Push harder today
+          </p>
+        </div>
+      )}
+
+      {/* Tier 2 penalty banner */}
+      {profile.penalty_tier === 2 && pendingPenaltyQuest && (
+        <div
+          className="px-4 py-2 text-center"
+          style={{ background: 'rgba(255,107,107,0.08)', borderBottom: '1px solid rgba(255,107,107,0.4)' }}
+        >
+          <p style={{ fontFamily: 'var(--font-share-tech-mono)', fontSize: '10px', color: '#ff6b6b' }}>
+            DEBT UNRESOLVED — Clear the penalty quest to continue
+          </p>
+        </div>
+      )}
+
       {/* Cycle expiry warning banner */}
       {cycleExpiresDays !== null && cycleExpiresDays > 0 && cycleExpiresDays <= 3 && (
         <div
@@ -351,6 +471,17 @@ export default function DashboardClient({
                 VIEW REPORT
               </button>
             )}
+            <button
+              onClick={handleRefresh}
+              disabled={isRefreshing}
+              title="Refresh quests"
+              className="text-xs tracking-widest hover:text-highlight-1 transition-colors disabled:cursor-not-allowed"
+              style={{ color: isRefreshing ? '#4B5563' : '#8D96B8', fontFamily: 'var(--font-share-tech-mono)' }}
+            >
+              {isRefreshing
+                ? <span className="inline-block w-2 h-2 rounded-full bg-current animate-pulse align-middle" />
+                : '↻'}
+            </button>
             <p className="text-xs text-text-secondary">
               <span style={{ color: completedCount >= kaizenThreshold ? '#34D399' : '#6CCBFF' }}>
                 {completedCount}
@@ -369,13 +500,23 @@ export default function DashboardClient({
           </p>
         </div>
 
-        <div className="space-y-2.5">
+        {/* Penalty quest at top of list */}
+        {penaltyQuestList.map((pq) => (
+          <PenaltyQuestCard
+            key={pq.id}
+            quest={pq}
+            processing={penaltyProcessingId === pq.id}
+            onComplete={() => handleCompletePenaltyQuest(pq)}
+          />
+        ))}
+
+        <div className={`space-y-2.5 ${questsLocked ? 'opacity-40 pointer-events-none' : ''}`}>
           {regularQuests.map((quest) => (
             <QuestCard
               key={quest.id}
               quest={quest}
               onToggle={() => handleToggleQuest(quest)}
-              processing={processingId === quest.id}
+              processing={processingIds.has(quest.id)}
               isFlashing={flashQuestId === quest.id}
             />
           ))}
@@ -386,7 +527,7 @@ export default function DashboardClient({
       <EliteQuestCard
         quest={eliteQuest ?? null}
         isLocked={isEliteLocked}
-        processingId={processingId}
+        processingIds={processingIds}
         flashQuestId={flashQuestId}
         onToggle={handleToggleQuest}
       />
@@ -495,7 +636,7 @@ function QuestCard({
   const catColor = CATEGORY_COLORS[quest.category] ?? '#8D96B8'
   return (
     <div
-      className={`flex items-center gap-3 p-3.5 border rounded-sm ${
+      className={`relative flex items-center gap-3 p-3.5 border rounded-sm ${
         isFlashing
           ? 'quest-complete-flash'
           : quest.is_completed
@@ -503,19 +644,19 @@ function QuestCard({
             : 'border-border bg-bg-secondary hover:border-aura-primary/30 transition-all'
       }`}
     >
+      {/* Checkmark renders from local state only — never waits for server */}
       <button
         onClick={onToggle}
-        disabled={processing}
         className={`flex-shrink-0 w-5 h-5 rounded-sm border transition-all ${
           quest.is_completed ? 'bg-aura-primary border-aura-primary' : 'border-border hover:border-aura-primary'
         }`}
       >
-        {quest.is_completed && !processing && (
+        {quest.is_completed && (
           <svg viewBox="0 0 16 16" fill="none" className="w-full h-full p-0.5">
             <path d="M3 8l4 4 6-6" stroke="#E7ECFF" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
           </svg>
         )}
-        {processing && (
+        {processing && !quest.is_completed && (
           <div className="w-full h-full flex items-center justify-center">
             <div className="w-2 h-2 rounded-full bg-aura-primary animate-pulse" />
           </div>
@@ -533,14 +674,17 @@ function QuestCard({
         <div className="w-1.5 h-1.5 rounded-full" style={{ background: catColor }} />
         <span className="text-xs text-text-secondary/60">+{quest.xp_reward}</span>
       </div>
+      {isFlashing && (
+        <span key={quest.id} className="xp-float">+{quest.xp_reward}</span>
+      )}
     </div>
   )
 }
 
 function EliteQuestCard({
-  quest, isLocked, processingId, flashQuestId, onToggle,
+  quest, isLocked, processingIds, flashQuestId, onToggle,
 }: {
-  quest: Quest | null; isLocked: boolean; processingId: string | null
+  quest: Quest | null; isLocked: boolean; processingIds: Set<string>
   flashQuestId: string | null; onToggle: (q: Quest) => void
 }) {
   if (isLocked) {
@@ -578,10 +722,69 @@ function EliteQuestCard({
       <QuestCard
         quest={quest}
         onToggle={() => onToggle(quest)}
-        processing={processingId === quest.id}
+        processing={processingIds.has(quest.id)}
         isFlashing={flashQuestId === quest.id}
       />
     </div>
   )
 }
 
+function PenaltyQuestCard({
+  quest,
+  processing,
+  onComplete,
+}: {
+  quest: PenaltyQuest
+  processing: boolean
+  onComplete: () => void
+}) {
+  return (
+    <div
+      className="mb-3 p-4 rounded-sm"
+      style={{
+        borderLeft: '3px solid #ff6b6b',
+        background: 'rgba(255,107,107,0.06)',
+        border: '1px solid rgba(255,107,107,0.25)',
+        borderLeftWidth: 3,
+      }}
+    >
+      <p
+        className="text-xs mb-2 tracking-widest"
+        style={{ fontFamily: 'var(--font-share-tech-mono)', color: '#ff6b6b' }}
+      >
+        PENALTY QUEST — Complete this first
+      </p>
+      <div className={`flex items-center gap-3 ${quest.is_completed ? 'opacity-50' : ''}`}>
+        <button
+          onClick={onComplete}
+          disabled={processing || quest.is_completed}
+          className={`flex-shrink-0 w-5 h-5 rounded-sm border transition-all ${
+            quest.is_completed
+              ? 'bg-red-500 border-red-500'
+              : 'border-red-500/60 hover:border-red-500'
+          }`}
+        >
+          {quest.is_completed && (
+            <svg viewBox="0 0 16 16" fill="none" className="w-full h-full p-0.5">
+              <path d="M3 8l4 4 6-6" stroke="#E7ECFF" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+            </svg>
+          )}
+          {processing && (
+            <div className="w-full h-full flex items-center justify-center">
+              <div className="w-2 h-2 rounded-full bg-red-500 animate-pulse" />
+            </div>
+          )}
+        </button>
+        <div className="flex-1 min-w-0">
+          <p className={`text-sm text-text-primary ${quest.is_completed ? 'line-through' : ''}`}>
+            {quest.title}
+          </p>
+          {quest.description && (
+            <p className="text-xs text-text-secondary/60 mt-0.5 leading-relaxed">{quest.description}</p>
+          )}
+        </div>
+        <span className="text-xs text-red-400/60 flex-shrink-0">+{quest.xp_reward} XP</span>
+      </div>
+    </div>
+  )
+}

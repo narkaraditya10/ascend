@@ -28,6 +28,23 @@ export interface UserProfile {
   last_active_date: string | null
   elite_quest_assigned_week: number | null
   needs_selection: boolean | null
+  penalty_tier: number
+  consecutive_failures: number
+  penalty_zone_active: boolean
+  penalty_zone_started_at: string | null
+  penalty_zone_active_time: number
+  penalty_zone_completed: boolean
+}
+
+export interface PenaltyQuest {
+  id: string
+  user_id: string
+  title: string
+  description: string | null
+  xp_reward: number
+  is_completed: boolean
+  date_assigned: string
+  created_at: string
 }
 
 export interface Stats {
