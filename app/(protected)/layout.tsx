@@ -1,4 +1,5 @@
 import BottomNav from '@/app/components/BottomNav'
+import InstallPrompt from '@/components/InstallPrompt'
 
 export default function ProtectedLayout({ children }: { children: React.ReactNode }) {
   return (
@@ -7,6 +8,7 @@ export default function ProtectedLayout({ children }: { children: React.ReactNod
         {children}
       </main>
       <BottomNav />
+      <InstallPrompt />
     </div>
   )
 }
