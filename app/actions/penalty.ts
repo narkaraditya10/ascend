@@ -3,11 +3,20 @@
 import { revalidatePath } from 'next/cache'
 import { createClient } from '@/lib/supabase/server'
 import { getRankFromLevel, getXPToNextLevel } from '@/lib/utils'
+import { getUTCDateString } from '@/lib/date'
 
 export async function completePenaltyZone() {
   const supabase = await createClient()
   const { data: { user } } = await supabase.auth.getUser()
   if (!user) return { success: false }
+
+  // Read active time before it gets reset to 0
+  const { data: currentData } = await supabase
+    .from('users')
+    .select('penalty_zone_active_time')
+    .eq('id', user.id)
+    .single()
+  const activeTime = currentData?.penalty_zone_active_time ?? 0
 
   await supabase
     .from('users')
@@ -20,6 +29,19 @@ export async function completePenaltyZone() {
     })
     .eq('id', user.id)
 
+  // Log to penalty_history (non-critical — table may not exist yet)
+  try {
+    await supabase.from('penalty_history').insert({
+      user_id: user.id,
+      date: getUTCDateString(),
+      penalty_tier: 3,
+      penalty_zone_triggered: true,
+      penalty_zone_completed: true,
+      penalty_zone_failed: false,
+      penalty_zone_duration_seconds: activeTime,
+    })
+  } catch {}
+
   revalidatePath('/dashboard')
   return { success: true }
 }
@@ -31,14 +53,16 @@ export async function failPenaltyZone() {
 
   const { data: profile } = await supabase
     .from('users')
-    .select('level, penalty_zone_active')
+    .select('level, current_xp, penalty_zone_active')
     .eq('id', user.id)
     .single()
 
   if (!profile?.penalty_zone_active) return { success: false }
 
-  const newLevel = Math.max(1, (profile.level ?? 1) - 1)
-  const newRank = getRankFromLevel(newLevel)
+  const levelBefore = profile.level ?? 1
+  const xpLost      = profile.current_xp ?? 0
+  const newLevel    = Math.max(1, levelBefore - 1)
+  const newRank     = getRankFromLevel(newLevel)
   const newXPToNext = getXPToNextLevel(newLevel)
 
   await supabase
@@ -60,6 +84,21 @@ export async function failPenaltyZone() {
     p_user_id: user.id,
     p_amount: 10,
   })
+
+  // Log to penalty_history
+  try {
+    await supabase.from('penalty_history').insert({
+      user_id: user.id,
+      date: getUTCDateString(),
+      penalty_tier: 3,
+      xp_lost: xpLost,
+      level_before: levelBefore,
+      level_after: newLevel,
+      penalty_zone_triggered: true,
+      penalty_zone_failed: true,
+      penalty_zone_completed: false,
+    })
+  } catch {}
 
   revalidatePath('/dashboard')
   return {
@@ -120,6 +159,17 @@ export async function completePenaltyQuest(penaltyQuestId: string) {
       })
       .eq('id', user.id)
   }
+
+  // Log quest completion to penalty_history
+  try {
+    await supabase.from('penalty_history').insert({
+      user_id: user.id,
+      date: getUTCDateString(),
+      penalty_tier: 2,
+      penalty_quest_assigned: true,
+      penalty_quest_completed: true,
+    })
+  } catch {}
 
   revalidatePath('/dashboard')
   return { success: true }

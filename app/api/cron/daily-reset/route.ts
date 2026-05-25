@@ -62,13 +62,15 @@ export async function GET(req: Request) {
       if (Date.now() >= deadline) {
         const { data: pzProfile } = await supabase
           .from('users')
-          .select('level')
+          .select('level, current_xp')
           .eq('id', user.id)
           .single()
 
-        const newLevel = Math.max(1, (pzProfile?.level ?? 1) - 1)
-        const newRank = getRankFromLevel(newLevel)
-        const newXPToNext = getXPToNextLevel(newLevel)
+        const pzLevel    = pzProfile?.level     ?? 1
+        const pzCurrentXP= pzProfile?.current_xp ?? 0
+        const newLevel   = Math.max(1, pzLevel - 1)
+        const newRank    = getRankFromLevel(newLevel)
+        const newXPToNext= getXPToNextLevel(newLevel)
 
         await supabase
           .from('users')
@@ -88,6 +90,22 @@ export async function GET(req: Request) {
           p_user_id: user.id,
           p_amount: 10,
         })
+
+        // Log Penalty Zone timeout fail to history
+        try {
+          await supabase.from('penalty_history').insert({
+            user_id: user.id,
+            date: today,
+            penalty_tier: 3,
+            xp_lost: pzCurrentXP,
+            level_before: pzLevel,
+            level_after: newLevel,
+            penalty_zone_triggered: true,
+            penalty_zone_failed: true,
+            penalty_zone_completed: false,
+            notes: 'Penalty Zone timed out via daily-reset cron.',
+          })
+        } catch {}
 
         await pushNotify(user.id, 'Penalty Zone Failed', 'Consequences applied. The weak remain weak.', 'penalty')
         processed++
@@ -174,6 +192,19 @@ export async function GET(req: Request) {
             })
             .eq('id', user.id)
 
+          // Log Tier 3 activation to history
+          try {
+            await supabase.from('penalty_history').insert({
+              user_id: user.id,
+              date: today,
+              penalty_tier: 3,
+              consecutive_failures: newConsecutiveFailures + 1, // value before reset
+              penalty_zone_triggered: true,
+              penalty_zone_completed: false,
+              penalty_zone_failed: false,
+            })
+          } catch {}
+
           await pushNotify(
             user.id,
             'PENALTY ZONE',
@@ -191,6 +222,20 @@ export async function GET(req: Request) {
             xp_reward: 120,
             date_assigned: today,
           })
+
+          // Log Tier 2 to history
+          try {
+            await supabase.from('penalty_history').insert({
+              user_id: user.id,
+              date: today,
+              penalty_tier: 2,
+              consecutive_failures: newConsecutiveFailures,
+              stats_reduced: { all_stats: 5 },
+              penalty_quest_assigned: true,
+              penalty_quest_completed: false,
+              penalty_zone_triggered: false,
+            })
+          } catch {}
 
           await pushNotify(
             user.id,
@@ -211,14 +256,27 @@ export async function GET(req: Request) {
           .not('stat_target', 'is', null)
 
         const uniqueStats = [...new Set((missedQuests ?? []).map((q) => q.stat_target).filter(Boolean))]
+        const statsReducedMap: Record<string, number> = {}
         for (const stat of uniqueStats) {
           await supabase.rpc('decrement_stat', {
             p_user_id: user.id,
             p_stat: stat,
             p_amount: 2,
           })
+          if (stat) statsReducedMap[stat] = 2
         }
         newPenaltyTier = 1
+
+        // Log Tier 1 to history
+        try {
+          await supabase.from('penalty_history').insert({
+            user_id: user.id,
+            date: today,
+            penalty_tier: 1,
+            stats_reduced: Object.keys(statsReducedMap).length > 0 ? statsReducedMap : null,
+            penalty_zone_triggered: false,
+          })
+        } catch {}
       } else if (completed >= threshold) {
         // Clear tier 1 on success
         if (user.penalty_tier === 1) {
