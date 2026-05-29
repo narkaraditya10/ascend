@@ -1,15 +1,25 @@
 import webpush from 'npm:web-push'
 import { createClient } from 'npm:@supabase/supabase-js'
 
+const vapidPublicKey =
+  Deno.env.get('VAPID_PUBLIC_KEY') ??
+  Deno.env.get('NEXT_PUBLIC_VAPID_PUBLIC_KEY') ??
+  ''
+const vapidPrivateKey = Deno.env.get('VAPID_PRIVATE_KEY') ?? ''
+const vapidEmailRaw = Deno.env.get('VAPID_EMAIL') ?? ''
+const vapidSubject = vapidEmailRaw.startsWith('mailto:')
+  ? vapidEmailRaw
+  : `mailto:${vapidEmailRaw}`
+
 const supabase = createClient(
   Deno.env.get('SUPABASE_URL') ?? '',
   Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? '',
 )
 
 webpush.setVapidDetails(
-  'mailto:' + Deno.env.get('VAPID_EMAIL'),
-  Deno.env.get('VAPID_PUBLIC_KEY') ?? '',
-  Deno.env.get('VAPID_PRIVATE_KEY') ?? '',
+  vapidSubject,
+  vapidPublicKey,
+  vapidPrivateKey,
 )
 
 async function sendToUser(
@@ -38,6 +48,10 @@ async function sendToUser(
 }
 
 Deno.serve(async (_req: Request) => {
+  if (!vapidPublicKey || !vapidPrivateKey || !vapidEmailRaw) {
+    return new Response(JSON.stringify({ ok: false, error: 'Missing VAPID configuration' }), { status: 500 })
+  }
+
   const now = new Date()
   const hour = now.getUTCHours()
   const today = now.toISOString().split('T')[0]

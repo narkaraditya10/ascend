@@ -57,7 +57,7 @@ export function sendLocalNotification(
   if (Notification.permission !== 'granted') return
   new Notification(title, {
     body,
-    icon: '/icon-192x192.png',
+    icon: '/icons/icon-192x192.png',
     tag,
   })
 }

@@ -162,7 +162,10 @@ Important behavior:
 - one daily quest is inserted per active non-elite selected quest pool
 - elite quest is inserted separately for level 6+ users
 - there is an in-process generation lock: `generatingUsers`
-- `ensureTodayQuests` re-fetches after insert to survive race conditions
+- `ensureTodayQuests` also keeps a per-user generated-date cache: `generatedDates`
+- quest generation now uses DB upserts with `onConflict: 'user_id,quest_pool_id,date_assigned'` as the final duplicate guard
+- `ensureTodayQuests` re-fetches after upsert to survive race conditions
+- `fetchToday()` intentionally avoids ordering by `created_at`; the tracked `quests` schema in [`supabase-schema.sql`](/C:/Users/Aditya/project/ascend/supabase-schema.sql) does not define that column, and using it caused valid quest reads to fail and dashboards to show `0` quests
 - dashboard client also calls `ensureTodayQuests` on mount if server rendered zero quests and no selection phase is needed
 
 ### Elite quest behavior
@@ -269,6 +272,13 @@ Core logic lives in:
 - Shield state shown in `StreakCard` component
 - When shield is consumed or awarded, `users.pending_system_message` is set and cleared on next dashboard load
 
+### Current streak processing implementation
+
+- `checkDailyStreak()` in [`app/actions/quests.ts`](/C:/Users/Aditya/project/ascend/app/actions/quests.ts) now delegates streak resolution to `updateStreak()` in [`lib/streakShield.ts`](/C:/Users/Aditya/project/ascend/lib/streakShield.ts)
+- On shield consumption, the app writes `pending_system_message = 'STREAK SHIELD CONSUMED. FAILURE ABSORBED. ONE CHANCE GIVEN.'`
+- On shield award, the app writes `pending_system_message = 'STREAK SHIELD EARNED. 21 DAYS OF CONSISTENCY ACKNOWLEDGED. SHIELD ACTIVE.'`
+- `daily_summary.streak_maintained` is treated as true both for normal threshold success and for shield-consumed failure absorption
+
 ### Penalty tiers
 
 - Tier 0: none
@@ -337,6 +347,12 @@ Notification flow:
 - subscription is saved to `push_subscriptions`
 - server action or edge scheduler calls `send-notification`
 - edge function loads subscription and sends Web Push payload
+
+Important configuration detail:
+
+- browser subscription uses `NEXT_PUBLIC_VAPID_PUBLIC_KEY`
+- edge functions now accept `VAPID_PUBLIC_KEY` and also fall back to `NEXT_PUBLIC_VAPID_PUBLIC_KEY` if the server-only copy is missing
+- `VAPID_EMAIL` may be stored either as `your@email.com` or `mailto:your@email.com`; the edge functions normalize it before calling `web-push`
 
 Scheduled reminder behavior in `notification-scheduler`:
 
@@ -511,6 +527,7 @@ Defined in [`.env.local.example`](/C:/Users/Aditya/project/ascend/.env.local.exa
 - `SUPABASE_SERVICE_ROLE_KEY`
 - `CRON_SECRET`
 - `NEXT_PUBLIC_VAPID_PUBLIC_KEY`
+- `VAPID_PUBLIC_KEY`
 - `VAPID_PRIVATE_KEY`
 - `VAPID_EMAIL`
 
@@ -558,19 +575,11 @@ Avoid flattening this into generic SaaS styling unless explicitly requested.
 - `archetype_quests` remains in schema/seed data but active daily generation comes from `quest_pools`.
 - Notification scheduling logic is UTC-based, while user-facing copy implies day-part reminders.
 - There is duplicate auth/onboarding redirect logic in both route handling and the root page, so changes to access rules should keep both paths aligned.
+- Parts of this document have been updated incrementally over time; when changing gameplay rules, verify that `memory.md` still matches both the latest code and schema, not just one of them.
 
-## Current workspace state observed during analysis
+## Maintenance note
 
-At the time this memory file was created, `git status --short` showed existing user changes in:
-
-- `app/(protected)/dashboard/page.tsx`
-- `app/actions/quests.ts`
-- `app/api/cron/daily-reset/route.ts`
-- `app/components/DashboardClient.tsx`
-- `lib/utils.ts`
-- untracked: `lib/date.ts`
-
-Treat those as pre-existing work unless you know otherwise.
+- Do not keep stale point-in-time worktree snapshots in this file. Document enduring architecture and behavior here; use `git status` directly when you need the current local change state.
 
 ## How to update this file
 
